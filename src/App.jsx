@@ -9,33 +9,63 @@ import { createWorker } from 'tesseract.js'
 const PEER_PREFIX = 'emeet-'
 const SCAN_INTERVAL_MS = 3000
 
-// STUN finds a direct path between devices. TURN relays the video when the
-// laptop and phone are on different networks (Wi-Fi vs mobile data), which is
-// the most common reason a joining device sees a blank screen.
-// The Open Relay servers below are a free public relay. For production, swap
-// in your own TURN credentials (Metered, Twilio, Cloudflare...).
-const ICE_SERVERS = [
+// STUN finds a direct path between devices on the same network.
+// TURN relays the video when the laptop and phone are on different networks
+// (Wi-Fi vs mobile data). The old public "openrelayproject" credentials no
+// longer work: Open Relay now needs a free account and API key from
+// https://www.metered.ca/tools/openrelay/
+// Put the key in a .env file next to package.json:
+//   VITE_METERED_API_KEY=your_key_here
+// Optional: VITE_METERED_URL overrides the credentials endpoint shown in your
+// Metered dashboard.
+const STUN_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
+  { urls: 'stun:global.stun.twilio.com:3478' }
 ]
 
-const PEER_OPTIONS = { debug: 1, config: { iceServers: ICE_SERVERS } }
+const METERED_KEY = import.meta.env.VITE_METERED_API_KEY || ''
+const METERED_URL =
+  import.meta.env.VITE_METERED_URL ||
+  'https://openrelayproject.metered.ca/api/v1/turn/credentials'
+
+// Simplest option: paste the "ICE Servers Array" from the Metered TURN page
+// into .env as one line:  VITE_ICE_SERVERS=[{"urls":"stun:..."},{...}]
+const STATIC_ICE = (() => {
+  try {
+    const parsed = JSON.parse(import.meta.env.VITE_ICE_SERVERS || '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+})()
+
+async function loadIceServers() {
+  if (STATIC_ICE.length) {
+    return { servers: [...STUN_SERVERS, ...STATIC_ICE], relay: true }
+  }
+
+  if (!METERED_KEY) return { servers: STUN_SERVERS, relay: false }
+
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${METERED_URL}?apiKey=${METERED_KEY}`, {
+      signal: controller.signal
+    })
+    clearTimeout(timer)
+
+    if (!response.ok) throw new Error(`TURN credentials failed (${response.status})`)
+
+    const turn = await response.json()
+    if (!Array.isArray(turn) || !turn.length) throw new Error('No TURN servers returned')
+
+    return { servers: [...STUN_SERVERS, ...turn], relay: true }
+  } catch (error) {
+    console.error('Could not load TURN servers:', error)
+    return { servers: STUN_SERVERS, relay: false }
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -112,7 +142,7 @@ const tuneVideoSender = call => {
         if (!params.encodings || !params.encodings.length) {
           params.encodings = [{}]
         }
-        params.encodings[0].maxBitrate = 2500000
+        params.encodings[0].maxBitrate = 1000000
         params.degradationPreference = 'maintain-resolution'
         await sender.setParameters(params)
       } catch {
@@ -209,6 +239,7 @@ function App() {
   const [needsTap, setNeedsTap] = useState(false)
   const [toast, setToast] = useState('')
   const [copied, setCopied] = useState('')
+  const [relayReady, setRelayReady] = useState(false)
 
   // Detection
   const [isScanning, setIsScanning] = useState(false)
@@ -238,6 +269,7 @@ function App() {
   const toastTimerRef = useRef(null)
   const isHostRef = useRef(true)
   const latestQuestionRef = useRef(null)
+  const iceServersRef = useRef(STUN_SERVERS)
 
   isHostRef.current = isHost
   latestQuestionRef.current = extractedQuestion
@@ -325,6 +357,19 @@ function App() {
 
     return () => clearInterval(timer)
   }, [isHost, roomCode, status, remoteStream])
+
+  // Load TURN relay credentials once so connections work across networks.
+  useEffect(() => {
+    let cancelled = false
+    loadIceServers().then(({ servers, relay }) => {
+      if (cancelled) return
+      iceServersRef.current = servers
+      setRelayReady(relay)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // Join links: https://your-site/?room=ABC123
   useEffect(() => {
@@ -438,7 +483,7 @@ function App() {
     setAutoDetect(true)
     setStatus('creating')
 
-    const peer = new Peer(PEER_PREFIX + code, PEER_OPTIONS)
+    const peer = new Peer(PEER_PREFIX + code, peerOptions())
     peerRef.current = peer
 
     peer.on('open', () => setStatus('waiting'))
@@ -500,6 +545,11 @@ function App() {
     })
   }
 
+  const peerOptions = () => ({
+    debug: 1,
+    config: { iceServers: iceServersRef.current }
+  })
+
   const handleStartCall = () => startHost(0)
 
   /* --------------------------- JOIN: connect --------------------------- */
@@ -514,7 +564,7 @@ function App() {
     setStatus('connecting')
     setShowJoinModal(false)
 
-    const peer = new Peer(undefined, PEER_OPTIONS)
+    const peer = new Peer(undefined, peerOptions())
     peerRef.current = peer
 
     // Register the call listener immediately so the screen is never missed.
@@ -543,7 +593,7 @@ function App() {
 
       const timeout = setTimeout(() => {
         if (peerRef.current === peer && !conn.open) {
-          notify('Could not reach the host. Check the code and that the session is active.')
+          notify(relayReady ? 'Could not reach the host. Check the code and that the laptop session is still open.' : 'Could not reach the host. On different networks this needs a TURN key (see setup). Same Wi-Fi works without one.')
           leaveSession()
         }
       }, 20000)
@@ -613,7 +663,7 @@ function App() {
       }
 
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 15, max: 30 } },
+        video: { frameRate: { ideal: 8, max: 15 } },
         audio: false
       })
 
@@ -1326,6 +1376,12 @@ function App() {
               autoComplete="off"
               className="w-full mt-5 bg-[#120b1e] border border-purple-800 rounded-xl p-4 text-center font-mono tracking-widest outline-none focus:border-purple-500"
             />
+
+            {!relayReady && (
+              <p className="text-xs text-amber-300 mt-3">
+                No relay server configured. Both devices must be on the same Wi-Fi unless a TURN key is set.
+              </p>
+            )}
 
             <div className="flex gap-3 mt-5">
               <button
