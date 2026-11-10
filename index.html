@@ -3,11 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0a0612" />
     <title>EmeeT - Share, Detect, Answer</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- PeerJS for real multi-device connections -->
-    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <!-- PeerJS and Tesseract are installed from npm (npm i peerjs tesseract.js),
+         so no extra <script> tags are needed here. -->
   </head>
   <body class="bg-[#0a0612]">
     <div id="root"></div>
