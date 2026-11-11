@@ -1066,7 +1066,7 @@ function App() {
   }
 
   // Draws only the needed part of the video (full screen or the chosen area).
-  const captureScreenFrame = () => {
+  const captureScreenFrame = (region = cropRect) => {
     const video = videoRef.current
 
     if (!video || !video.srcObject) {
@@ -1082,11 +1082,11 @@ function App() {
     let sw = video.videoWidth
     let sh = video.videoHeight
 
-    if (cropRect) {
-      sx = Math.max(0, Math.round((video.videoWidth * cropRect.x) / 100))
-      sy = Math.max(0, Math.round((video.videoHeight * cropRect.y) / 100))
-      sw = Math.max(1, Math.min(video.videoWidth - sx, Math.round((video.videoWidth * cropRect.width) / 100)))
-      sh = Math.max(1, Math.min(video.videoHeight - sy, Math.round((video.videoHeight * cropRect.height) / 100)))
+    if (region) {
+      sx = Math.max(0, Math.round((video.videoWidth * region.x) / 100))
+      sy = Math.max(0, Math.round((video.videoHeight * region.y) / 100))
+      sw = Math.max(1, Math.min(video.videoWidth - sx, Math.round((video.videoWidth * region.width) / 100)))
+      sh = Math.max(1, Math.min(video.videoHeight - sy, Math.round((video.videoHeight * region.height) / 100)))
     }
 
     const canvas = document.createElement('canvas')
@@ -1442,13 +1442,72 @@ function App() {
     })
   }
 
-  const finishCropSelection = () => {
+  // The video is letterboxed inside its box, so convert the dragged box
+  // (percent of the box) into percent of the real video picture.
+  const dragToVideoRegion = drag => {
+    const wrap = videoWrapRef.current
+    const video = videoRef.current
+    if (!wrap || !video?.videoWidth || !video?.videoHeight) return null
+
+    const boxW = wrap.clientWidth
+    const boxH = wrap.clientHeight
+    const videoRatio = video.videoWidth / video.videoHeight
+
+    let shownW = boxW
+    let shownH = boxH
+    if (videoRatio > boxW / boxH) shownH = boxW / videoRatio
+    else shownW = boxH * videoRatio
+
+    const offsetX = (boxW - shownW) / 2
+    const offsetY = (boxH - shownH) / 2
+
+    const left = (drag.x / 100) * boxW - offsetX
+    const top = (drag.y / 100) * boxH - offsetY
+    const right = left + (drag.width / 100) * boxW
+    const bottom = top + (drag.height / 100) * boxH
+
+    const clamp = value => Math.max(0, Math.min(100, value))
+    const x1 = clamp((left / shownW) * 100)
+    const y1 = clamp((top / shownH) * 100)
+    const x2 = clamp((right / shownW) * 100)
+    const y2 = clamp((bottom / shownH) * 100)
+
+    return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 }
+  }
+
+  // Letting go of the drag takes a screenshot of the selected area.
+  const finishCropSelection = async () => {
     if (!cropStartRef.current) return
-    if (cropDraft && cropDraft.width > 1 && cropDraft.height > 1) {
-      setCropRect(cropDraft)
-    }
-    setCropDraft(null)
+
+    const drag = cropDraft
     cropStartRef.current = null
+    setCropDraft(null)
+    setIsSelectingCrop(false)
+
+    if (!drag || drag.width < 2 || drag.height < 2) {
+      notify('Drag a larger area to take a screenshot.')
+      return
+    }
+
+    try {
+      const region = dragToVideoRegion(drag)
+      if (!region || region.width < 1 || region.height < 1) {
+        notify('Select an area inside the shared screen.')
+        return
+      }
+
+      const canvas = captureScreenFrame(region)
+      const blob = await canvasToPngBlob(canvas)
+      await handleScreenshotBlob(blob)
+    } catch (error) {
+      console.error('Area screenshot error:', error)
+      notify(error.message || 'Could not capture that area.')
+    }
+  }
+
+  const cancelCropSelection = () => {
+    cropStartRef.current = null
+    setCropDraft(null)
     setIsSelectingCrop(false)
   }
 
@@ -1722,7 +1781,7 @@ function App() {
                   onPointerDown={startCropSelection}
                   onPointerMove={moveCropSelection}
                   onPointerUp={finishCropSelection}
-                  onPointerCancel={finishCropSelection}
+                  onPointerCancel={cancelCropSelection}
                 >
                   <video
                     ref={videoRef}
@@ -1756,7 +1815,7 @@ function App() {
 
                   {isSelectingCrop && (
                     <div className="absolute inset-x-0 top-0 bg-black/65 text-center text-xs text-white py-2 pointer-events-none">
-                      Drag over the question area, then release
+                      Drag over the question, then let go to take a screenshot
                     </div>
                   )}
                 </div>
@@ -1769,7 +1828,7 @@ function App() {
                     }}
                     className={`flex-1 min-w-[130px] border px-3 py-3 rounded-lg text-sm ${isSelectingCrop ? 'border-cyan-400 text-cyan-300' : 'border-purple-800 text-gray-300'}`}
                   >
-                    Select Question Area
+                    Screenshot an Area
                   </button>
                   {cropRect && (
                     <button
