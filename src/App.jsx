@@ -1304,6 +1304,13 @@ function App() {
       )
     })
 
+  // Shows a question in the main card and sends it to joined devices.
+  const publishQuestion = question => {
+    lastQuestionTextRef.current = `${question.question} ${question.options.join(' ')}`
+    setExtractedQuestion(question)
+    broadcast({ type: 'question', question })
+  }
+
   // Any new screenshot (paste, drop, picker, clipboard) ends up here.
   const handleScreenshotBlob = async (blob, { skipDuplicate = false } = {}) => {
     if (!blob || !blob.type?.startsWith('image/')) return
@@ -1321,7 +1328,7 @@ function App() {
 
       setShot(prev => {
         if (prev?.url) URL.revokeObjectURL(prev.url)
-        return { id, url, blob: png, status: 'scanning', extracted: null, error: '' }
+        return { id, url, blob: png, status: 'scanning', question: '', options: '', error: '' }
       })
       setOcrProgress(0)
 
@@ -1329,9 +1336,17 @@ function App() {
 
       setShot(prev =>
         prev && prev.id === id
-          ? { ...prev, status: 'done', extracted: best.question ? best : null }
+          ? {
+              ...prev,
+              status: 'done',
+              question: best.question || '',
+              options: best.options.join('\n')
+            }
           : prev
       )
+
+      // The question is now text: show it in the main card too.
+      if (best.question) publishQuestion(best)
     } catch (error) {
       console.error('Screenshot error:', error)
       setShot(prev =>
@@ -1376,38 +1391,63 @@ function App() {
     }
   }
 
-  // Copies the screenshot, then opens Claude with the question typed in.
-  const sendShotToClaude = () => {
+  // Opens Claude with the question typed in. withImage also copies the
+  // screenshot so it can be pasted next to the text.
+  const sendShotToClaude = (withImage = true) => {
     if (!shot) return
 
-    const base = shot.extracted?.question
-      ? buildPrompt(shot.extracted)
+    const edited = {
+      question: shot.question.trim(),
+      options: shot.options
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+    const hasText = Boolean(edited.question)
+
+    if (!hasText && !withImage) {
+      notify('No question text yet. Type it in, or send with the screenshot.')
+      return
+    }
+
+    if (hasText) publishQuestion(edited)
+
+    const base = hasText
+      ? buildPrompt(edited)
       : 'Find the question in the attached screenshot and give me the correct answer. If it has options, tell me which option is correct.'
 
-    const prompt = `${base}\n\n(The screenshot of the question is attached.)`.slice(0, 1800)
+    const prompt = (
+      withImage ? `${base}\n\n(The screenshot of the question is attached.)` : base
+    ).slice(0, 1800)
 
     // Start the copy first, while this tab still has focus.
-    let copying
-    try {
-      if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
-        throw new Error('Image copy is not supported here.')
+    let copying = null
+    if (withImage) {
+      try {
+        if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
+          throw new Error('Image copy is not supported here.')
+        }
+        copying = navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': shot.blob })
+        ])
+      } catch (error) {
+        copying = Promise.reject(error)
       }
-      copying = navigator.clipboard.write([
-        new ClipboardItem({ 'image/png': shot.blob })
-      ])
-    } catch (error) {
-      copying = Promise.reject(error)
     }
 
     window.open(`https://claude.ai/new?q=${encodeURIComponent(prompt)}`, '_blank')
 
-    copying
-      .then(() =>
-        notify('Screenshot copied. In Claude, paste it (Ctrl+V) next to the question, then send.')
-      )
-      .catch(() =>
-        notify('Could not copy the screenshot. Attach it in Claude manually.')
-      )
+    if (copying) {
+      copying
+        .then(() =>
+          notify('Screenshot copied. In Claude, paste it (Ctrl+V) next to the question, then send.')
+        )
+        .catch(() =>
+          notify('Could not copy the screenshot. Attach it in Claude manually.')
+        )
+    } else {
+      notify('Question sent to Claude. Press send there.')
+    }
 
     closeShot()
   }
@@ -1756,10 +1796,13 @@ function App() {
           )}
 
           {/* SCREEN AND QUESTION */}
-          {hasScreen && (
-            <section className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
+          {(hasScreen || extractedQuestion) && (
+            <section
+              className={`grid grid-cols-1 ${hasScreen ? 'lg:grid-cols-2' : ''} gap-4 sm:gap-5`}
+            >
 
               {/* LIVE SCREEN */}
+              {hasScreen && (
               <div className="bg-[#1a102a] border border-purple-500/20 rounded-2xl p-3 sm:p-5">
 
                 <div className="flex items-center justify-between mb-3">
@@ -1876,6 +1919,8 @@ function App() {
                   </div>
                 )}
               </div>
+
+              )}
 
               {/* QUESTION DETECTION */}
               <div className="bg-[#1a102a] border border-purple-500/20 rounded-2xl p-4 sm:p-5 flex flex-col">
@@ -2023,67 +2068,91 @@ function App() {
           <div className="bg-[#1a102a] border border-purple-500/30 rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-4 sm:p-6">
             <h2 className="text-xl font-semibold">Screenshot detected</h2>
             <p className="text-sm text-gray-400 mt-1">
-              Send it to Claude together with the question found in it?
+              The question is converted to text. Fix anything that looks wrong, then send it to Claude.
             </p>
 
             <img
               src={shot.url}
               alt="Screenshot preview"
-              className="mt-4 w-full max-h-56 object-contain rounded-xl border border-purple-900/50 bg-black"
+              className="mt-4 w-full max-h-28 object-contain rounded-xl border border-purple-900/50 bg-black"
             />
 
-            <div className="mt-4 bg-[#120b1e] rounded-xl p-4 border border-purple-800/40">
-              {shot.status === 'scanning' && (
+            {shot.status === 'scanning' ? (
+              <div className="mt-4 bg-[#120b1e] rounded-xl p-4 border border-purple-800/40">
                 <p className="text-sm text-purple-200">
-                  Reading the question... {ocrProgress > 0 ? `${ocrProgress}%` : ''}
+                  Converting to text... {ocrProgress > 0 ? `${ocrProgress}%` : ''}
                 </p>
-              )}
+                <div className="mt-3 bg-[#0a0612] rounded-full h-2 overflow-hidden">
+                  <div
+                    className="bg-purple-500 h-full transition-all"
+                    style={{ width: `${ocrProgress}%` }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="mt-4 space-y-4">
+                {!shot.question && (
+                  <p className="text-sm text-amber-300">
+                    {shot.error ||
+                      'No clear question text was found. Type it below, or send with the screenshot and Claude will read it.'}
+                  </p>
+                )}
 
-              {shot.status === 'done' && shot.extracted && (
-                <>
-                  <p className="text-xs text-purple-300 mb-2">EXTRACTED QUESTION</p>
-                  <p className="font-medium leading-relaxed">{shot.extracted.question}</p>
+                <div>
+                  <label className="block text-xs text-purple-300 mb-2">QUESTION</label>
+                  <textarea
+                    value={shot.question}
+                    onChange={e =>
+                      setShot(prev => (prev ? { ...prev, question: e.target.value } : prev))
+                    }
+                    rows={3}
+                    className="w-full bg-[#120b1e] border border-purple-800/60 rounded-xl p-3 text-[15px] leading-relaxed outline-none focus:border-purple-500 resize-y"
+                  />
+                </div>
 
-                  {shot.extracted.options.length > 0 && (
-                    <div className="mt-3 space-y-1">
-                      <p className="text-xs text-purple-300">ANSWER OPTIONS</p>
-                      {shot.extracted.options.map((option, index) => (
-                        <p key={index} className="text-sm text-gray-300">
-                          {option}
-                        </p>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
+                <div>
+                  <label className="block text-xs text-purple-300 mb-2">
+                    ANSWER OPTIONS (one per line)
+                  </label>
+                  <textarea
+                    value={shot.options}
+                    onChange={e =>
+                      setShot(prev => (prev ? { ...prev, options: e.target.value } : prev))
+                    }
+                    rows={4}
+                    placeholder="No options found"
+                    className="w-full bg-[#120b1e] border border-purple-800/60 rounded-xl p-3 text-sm leading-relaxed outline-none focus:border-purple-500 resize-y"
+                  />
+                </div>
+              </div>
+            )}
 
-              {shot.status === 'done' && !shot.extracted && (
-                <p className="text-sm text-amber-300">
-                  {shot.error ||
-                    'No clear question text was found. Claude can still read the screenshot itself.'}
-                </p>
-              )}
-            </div>
-
-            <p className="text-xs text-gray-500 mt-3">
-              The screenshot is copied and Claude opens with the question typed in. Paste the screenshot into the message (Ctrl+V), then send.
-            </p>
-
-            <div className="flex gap-3 mt-5">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-5">
               <button
                 onClick={closeShot}
-                className="flex-1 bg-[#241538] rounded-xl p-3"
+                className="bg-[#241538] rounded-xl p-3"
               >
                 Dismiss
               </button>
               <button
-                onClick={sendShotToClaude}
+                onClick={() => sendShotToClaude(false)}
                 disabled={shot.status === 'scanning'}
-                className="flex-1 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 rounded-xl p-3 font-medium"
+                className="border border-purple-500/60 disabled:opacity-50 rounded-xl p-3"
               >
-                {shot.status === 'scanning' ? 'Reading...' : 'Send to Claude'}
+                Send text
+              </button>
+              <button
+                onClick={() => sendShotToClaude(true)}
+                disabled={shot.status === 'scanning'}
+                className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 rounded-xl p-3 font-medium"
+              >
+                Send with screenshot
               </button>
             </div>
+
+            <p className="text-xs text-gray-500 mt-3">
+              Send text opens Claude with the question typed in. Send with screenshot also copies the image, so paste it (Ctrl+V) in the message before sending.
+            </p>
           </div>
         </div>
       )}
