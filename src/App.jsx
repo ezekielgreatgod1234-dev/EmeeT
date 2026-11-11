@@ -296,6 +296,21 @@ function App() {
   const [copied, setCopied] = useState('')
   const [relayReady, setRelayReady] = useState(false)
   const [shot, setShot] = useState(null)
+  const [installEvent, setInstallEvent] = useState(
+    () => window.__installPrompt || null
+  )
+  const [installDismissed, setInstallDismissed] = useStoredState(
+    'emeet.installDismissed',
+    false
+  )
+  const [isStandalone, setIsStandalone] = useState(
+    () =>
+      Boolean(window.matchMedia?.('(display-mode: standalone)').matches) ||
+      window.navigator.standalone === true
+  )
+  const isIOS =
+    /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
   const [clipWatch, setClipWatch] = useStoredState('emeet.clipWatch', false)
 
   // Detection
@@ -468,6 +483,24 @@ function App() {
     return () => {
       document.removeEventListener('visibilitychange', onBack)
       window.removeEventListener('online', onBack)
+    }
+  }, [])
+
+  // PWA install: remember the browser's install prompt and hide the banner once installed.
+  useEffect(() => {
+    const onReady = () => setInstallEvent(window.__installPrompt || null)
+    const onInstalled = () => {
+      window.__installPrompt = null
+      setInstallEvent(null)
+      setIsStandalone(true)
+      notify('EmeeT installed.')
+    }
+
+    window.addEventListener('emeet-install-ready', onReady)
+    window.addEventListener('appinstalled', onInstalled)
+    return () => {
+      window.removeEventListener('emeet-install-ready', onReady)
+      window.removeEventListener('appinstalled', onInstalled)
     }
   }, [])
 
@@ -1227,6 +1260,23 @@ function App() {
     }
   }
 
+  /* --------------------------- PWA install --------------------------- */
+
+  const installApp = async () => {
+    if (!installEvent) return
+
+    try {
+      installEvent.prompt()
+      await installEvent.userChoice
+    } catch (error) {
+      console.error('Install error:', error)
+    }
+
+    // A prompt can only be used once.
+    window.__installPrompt = null
+    setInstallEvent(null)
+  }
+
   /* ------------------------- screenshots ------------------------- */
 
   const closeShot = () => {
@@ -1503,6 +1553,37 @@ function App() {
         </header>
 
         <div className="max-w-6xl mx-auto p-3 sm:p-4 md:p-6 space-y-4 sm:space-y-6">
+
+          {/* INSTALL */}
+          {!isStandalone && !installDismissed && (installEvent || isIOS) && (
+            <section className="bg-purple-600/20 border border-purple-500/40 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0 flex-1 basis-56">
+                <h2 className="font-semibold text-sm">Install EmeeT</h2>
+                <p className="text-xs text-purple-200 mt-1">
+                  {installEvent
+                    ? 'Add EmeeT to your home screen or desktop and open it like an app.'
+                    : 'On iPhone or iPad, open this page in Safari, tap the Share button, then choose Add to Home Screen.'}
+                </p>
+              </div>
+
+              <div className="flex gap-2">
+                {installEvent && (
+                  <button
+                    onClick={installApp}
+                    className="bg-purple-600 hover:bg-purple-500 px-5 py-3 rounded-xl text-sm font-medium"
+                  >
+                    Install
+                  </button>
+                )}
+                <button
+                  onClick={() => setInstallDismissed(true)}
+                  className="border border-purple-500/60 px-4 py-3 rounded-xl text-sm text-gray-200"
+                >
+                  Not now
+                </button>
+              </div>
+            </section>
+          )}
 
           {/* SCREENSHOTS */}
           <section className="bg-[#1a102a] border border-purple-500/20 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">

@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "name": "EmeeT - Share, Detect, Answer",
+  "short_name": "EmeeT",
+  "description": "Share a screen between devices, detect questions and send them to Claude.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a0612",
+  "theme_color": "#0a0612",
+  "categories": ["productivity", "education"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
