@@ -71,6 +71,60 @@ async function loadIceServers() {
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+const SESSION_KEY = 'emeet.session'
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+const readSession = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null')
+    if (!saved?.code || !saved?.role) return null
+    if (Date.now() - (saved.savedAt || 0) > SESSION_MAX_AGE_MS) return null
+    return saved
+  } catch {
+    return null
+  }
+}
+
+const writeSession = session => {
+  try {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ ...session, savedAt: Date.now() })
+    )
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const clearSession = () => {
+  try {
+    localStorage.removeItem(SESSION_KEY)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function useStoredState(key, initial) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key)
+      return raw === null ? initial : JSON.parse(raw)
+    } catch {
+      return initial
+    }
+  })
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value))
+    } catch {
+      /* storage unavailable */
+    }
+  }, [key, value])
+
+  return [value, setValue]
+}
+
 const generateCode = () => {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
   let code = ''
@@ -217,6 +271,7 @@ const STATUS_TEXT = {
   idle: 'Ready',
   creating: 'Starting...',
   connecting: 'Connecting...',
+  reconnecting: 'Reconnecting...',
   waiting: 'Waiting for a device',
   live: 'Live'
 }
@@ -240,6 +295,8 @@ function App() {
   const [toast, setToast] = useState('')
   const [copied, setCopied] = useState('')
   const [relayReady, setRelayReady] = useState(false)
+  const [shot, setShot] = useState(null)
+  const [clipWatch, setClipWatch] = useStoredState('emeet.clipWatch', false)
 
   // Detection
   const [isScanning, setIsScanning] = useState(false)
@@ -270,8 +327,17 @@ function App() {
   const isHostRef = useRef(true)
   const latestQuestionRef = useRef(null)
   const iceServersRef = useRef(STUN_SERVERS)
+  const relayReadyRef = useRef(false)
+  const joinStateRef = useRef({ retryTimer: null, retryNow: null })
+  const hostRetryRef = useRef(null)
+  const ocrQueueRef = useRef(Promise.resolve())
+  const lastShotSigRef = useRef('')
+  const shotInputRef = useRef(null)
+  const handleShotRef = useRef(null)
+  const checkClipboardRef = useRef(null)
 
   isHostRef.current = isHost
+  relayReadyRef.current = relayReady
   latestQuestionRef.current = extractedQuestion
 
   const activeStream = isHost ? localStream : remoteStream
@@ -358,27 +424,120 @@ function App() {
     return () => clearInterval(timer)
   }, [isHost, roomCode, status, remoteStream])
 
-  // Load TURN relay credentials once so connections work across networks.
+  // On load: fetch relay servers, then resume a saved session or open a join link.
   useEffect(() => {
     let cancelled = false
+
     loadIceServers().then(({ servers, relay }) => {
       if (cancelled) return
+
       iceServersRef.current = servers
       setRelayReady(relay)
+
+      const room = (new URLSearchParams(window.location.search).get('room') || '')
+        .toUpperCase()
+        .slice(0, 8)
+      const saved = readSession()
+
+      // A different room in the link wins over the saved one.
+      if (room && !(saved?.role === 'join' && saved.code === room)) {
+        setJoinCode(room)
+        setShowJoinModal(true)
+        return
+      }
+
+      if (saved?.role === 'join') joinRoom(saved.code, { restoring: true })
+      else if (saved?.role === 'host') startHost(0, saved.code)
     })
+
     return () => {
       cancelled = true
     }
   }, [])
 
-  // Join links: https://your-site/?room=ABC123
+  // When the phone wakes up or the network returns, reconnect right away.
   useEffect(() => {
-    const room = new URLSearchParams(window.location.search).get('room')
-    if (room) {
-      setJoinCode(room.toUpperCase().slice(0, 8))
-      setShowJoinModal(true)
+    const onBack = () => {
+      if (document.visibilityState === 'hidden') return
+      if (isHostRef.current || !peerRef.current) return
+      joinStateRef.current.retryNow?.()
+    }
+
+    document.addEventListener('visibilitychange', onBack)
+    window.addEventListener('online', onBack)
+    return () => {
+      document.removeEventListener('visibilitychange', onBack)
+      window.removeEventListener('online', onBack)
     }
   }, [])
+
+  // Keep the latest screenshot handlers available to the listeners below.
+  useEffect(() => {
+    handleShotRef.current = handleScreenshotBlob
+    checkClipboardRef.current = checkClipboardForImage
+  })
+
+  // Screenshots: paste (Ctrl+V), drag and drop, and the PrintScreen key.
+  useEffect(() => {
+    const onPaste = event => {
+      const items = Array.from(event.clipboardData?.items || [])
+      const imageItem = items.find(item => item.type.startsWith('image/'))
+      const file = imageItem?.getAsFile()
+      if (file) {
+        event.preventDefault()
+        handleShotRef.current?.(file)
+      }
+    }
+
+    const onDragOver = event => {
+      if (event.dataTransfer?.types?.includes('Files')) event.preventDefault()
+    }
+
+    const onDrop = event => {
+      const file = Array.from(event.dataTransfer?.files || []).find(item =>
+        item.type.startsWith('image/')
+      )
+      if (file) {
+        event.preventDefault()
+        handleShotRef.current?.(file)
+      }
+    }
+
+    const onKeyUp = event => {
+      if (event.key === 'PrintScreen') {
+        notify('Screenshot taken. Paste it here with Ctrl+V.')
+        setTimeout(() => checkClipboardRef.current?.(), 600)
+      }
+    }
+
+    window.addEventListener('paste', onPaste)
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('drop', onDrop)
+    window.addEventListener('keyup', onKeyUp)
+
+    return () => {
+      window.removeEventListener('paste', onPaste)
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('drop', onDrop)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [])
+
+  // Optional: notice a new screenshot in the clipboard when you return to this tab.
+  useEffect(() => {
+    if (!clipWatch) return
+
+    const check = () => {
+      if (document.visibilityState === 'visible') checkClipboardRef.current?.()
+    }
+
+    window.addEventListener('focus', check)
+    document.addEventListener('visibilitychange', check)
+    return () => {
+      window.removeEventListener('focus', check)
+      document.removeEventListener('visibilitychange', check)
+    }
+  }, [clipWatch])
 
   // Cleanup when the app closes.
   useEffect(() => {
@@ -386,7 +545,10 @@ function App() {
       localStreamRef.current?.getTracks().forEach(track => track.stop())
       callsRef.current.forEach(call => call.close())
       connectionsRef.current.forEach(conn => conn.close())
+      clearTimeout(joinStateRef.current.retryTimer)
+      clearTimeout(hostRetryRef.current)
       peerRef.current?.destroy()
+      peerRef.current = null
       workerPromiseRef.current?.then(worker => worker.terminate()).catch(() => {})
       clearTimeout(toastTimerRef.current)
     }
@@ -433,15 +595,37 @@ function App() {
   const leaveSession = () => {
     const peer = peerRef.current
     peerRef.current = null // handlers check this to know the session is over
+    clearSession()
+    clearTimeout(joinStateRef.current.retryTimer)
+    clearTimeout(hostRetryRef.current)
 
     localStreamRef.current?.getTracks().forEach(track => track.stop())
     localStreamRef.current = null
 
-    callsRef.current.forEach(call => call.close())
+    const calls = Array.from(callsRef.current.values())
+    const conns = Array.from(connectionsRef.current.values())
     callsRef.current.clear()
-    connectionsRef.current.forEach(conn => conn.close())
     connectionsRef.current.clear()
-    peer?.destroy()
+
+    const closeAll = () => {
+      calls.forEach(call => call.close())
+      conns.forEach(conn => conn.close())
+      peer?.destroy()
+    }
+
+    if (isHostRef.current && conns.some(conn => conn.open)) {
+      // Tell joined devices the session is over so they do not keep retrying.
+      conns.forEach(conn => {
+        try {
+          if (conn.open) conn.send({ type: 'ended' })
+        } catch {
+          /* closing */
+        }
+      })
+      setTimeout(closeAll, 400)
+    } else {
+      closeAll()
+    }
 
     setLocalStream(null)
     setRemoteStream(null)
@@ -469,19 +653,31 @@ function App() {
     if (data.type === 'stopped') {
       setRemoteStream(null)
     }
+
+    if (data.type === 'ended') {
+      notify('The host ended the session.')
+      leaveSession()
+    }
   }
 
   /* --------------------------- HOST: create --------------------------- */
 
-  const startHost = (attempt = 0) => {
+  const peerOptions = () => ({
+    debug: 1,
+    config: { iceServers: iceServersRef.current }
+  })
+
+  // resumeCode: reuse the saved room code after a page refresh.
+  const startHost = (attempt = 0, resumeCode = '') => {
     if (peerRef.current) return
 
-    const code = generateCode()
+    const code = resumeCode || generateCode()
 
     setRoomCode(code)
     setIsHost(true)
     setAutoDetect(true)
     setStatus('creating')
+    writeSession({ role: 'host', code })
 
     const peer = new Peer(PEER_PREFIX + code, peerOptions())
     peerRef.current = peer
@@ -499,7 +695,7 @@ function App() {
           conn.send({ type: 'question', question: latestQuestionRef.current })
         }
 
-        callJoiner(conn.peer)
+        callJoiner(conn.peer, true)
       })
 
       conn.on('data', data => {
@@ -507,9 +703,10 @@ function App() {
       })
 
       const drop = () => {
-        if (connectionsRef.current.get(conn.peer) === conn) {
-          connectionsRef.current.delete(conn.peer)
-        }
+        // Ignore old connections that a newer one has already replaced.
+        if (connectionsRef.current.get(conn.peer) !== conn) return
+
+        connectionsRef.current.delete(conn.peer)
         callsRef.current.get(conn.peer)?.close()
         callsRef.current.delete(conn.peer)
         setJoiners(prev => prev.filter(id => id !== conn.peer))
@@ -531,10 +728,25 @@ function App() {
 
       if (error.type === 'peer-unavailable') return
 
-      if (error.type === 'unavailable-id' && attempt < 3) {
+      if (error.type === 'unavailable-id') {
+        if (peerRef.current !== peer) return
         peerRef.current = null
         peer.destroy()
-        startHost(attempt + 1)
+
+        if (resumeCode && attempt < 8) {
+          // After a refresh the old id can take a few seconds to free up.
+          hostRetryRef.current = setTimeout(
+            () => startHost(attempt + 1, resumeCode),
+            2500
+          )
+        } else if (resumeCode) {
+          startHost(0) // give up on the old code and make a new room
+        } else if (attempt < 3) {
+          startHost(attempt + 1)
+        } else {
+          notify('Could not create a room. Please try again.')
+          leaveSession()
+        }
         return
       }
 
@@ -545,27 +757,132 @@ function App() {
     })
   }
 
-  const peerOptions = () => ({
-    debug: 1,
-    config: { iceServers: iceServersRef.current }
-  })
-
   const handleStartCall = () => startHost(0)
 
   /* --------------------------- JOIN: connect --------------------------- */
 
-  const handleJoin = () => {
-    const code = joinCode.trim().toUpperCase()
+  // restoring: true after a page refresh. A restored (or already connected)
+  // session keeps retrying quietly instead of giving up.
+  const joinRoom = (rawCode, { restoring = false } = {}) => {
+    const code = (rawCode || '').trim().toUpperCase()
     if (!code || peerRef.current) return
 
+    const state = {
+      code,
+      everConnected: false,
+      restoring,
+      lostNotified: false,
+      retryTimer: null,
+      retryNow: null
+    }
+    joinStateRef.current = state
+
+    writeSession({ role: 'join', code })
     setRoomCode(code)
     setIsHost(false)
     setAutoDetect(false) // the laptop detects; results are sent here
-    setStatus('connecting')
+    setStatus(restoring ? 'reconnecting' : 'connecting')
     setShowJoinModal(false)
 
     const peer = new Peer(undefined, peerOptions())
     peerRef.current = peer
+
+    const hostLost = message => {
+      if (peerRef.current !== peer) return
+
+      callsRef.current.get('host')?.close()
+      callsRef.current.delete('host')
+      connectionsRef.current.delete('host')
+      setRemoteStream(null)
+      setJoiners([])
+
+      if (!state.everConnected && !state.restoring) {
+        notify(message || 'Could not reach the host.')
+        leaveSession()
+        return
+      }
+
+      setStatus('reconnecting')
+
+      if (state.everConnected && !state.lostNotified) {
+        state.lostNotified = true
+        notify('Connection lost. Reconnecting...')
+      }
+
+      clearTimeout(state.retryTimer)
+      state.retryTimer = setTimeout(connectToHost, 3000)
+    }
+
+    const connectToHost = () => {
+      if (peerRef.current !== peer) return
+
+      if (peer.destroyed) {
+        // The signaling connection died for good: start a fresh peer.
+        peerRef.current = null
+        joinRoom(code, { restoring: true })
+        return
+      }
+
+      if (peer.disconnected) {
+        peer.reconnect()
+        clearTimeout(state.retryTimer)
+        state.retryTimer = setTimeout(connectToHost, 1500)
+        return
+      }
+
+      const previous = connectionsRef.current.get('host')
+      if (previous?.open) return
+      if (previous) {
+        previous._skip = true
+        previous.close()
+      }
+
+      const conn = peer.connect(PEER_PREFIX + code, { reliable: true })
+      connectionsRef.current.set('host', conn)
+
+      const timeout = setTimeout(() => {
+        if (peerRef.current === peer && !conn.open) {
+          conn._skip = true
+          conn.close()
+          hostLost(
+            relayReadyRef.current
+              ? 'Could not reach the host. Check the code and that the laptop session is still open.'
+              : 'Could not reach the host. On different networks this needs a TURN key (see setup). Same Wi-Fi works without one.'
+          )
+        }
+      }, 15000)
+
+      conn.on('open', () => {
+        clearTimeout(timeout)
+        clearTimeout(state.retryTimer)
+        state.everConnected = true
+        state.lostNotified = false
+        setStatus('live')
+        setJoiners([code])
+        conn.send({ type: 'ready' })
+      })
+
+      conn.on('data', handleHostMessage)
+
+      conn.on('close', () => {
+        clearTimeout(timeout)
+        if (!conn._skip) hostLost('The host ended the session.')
+      })
+
+      conn.on('error', error => {
+        console.error(error)
+        clearTimeout(timeout)
+        if (!conn._skip) hostLost('Unable to connect. Check the room code.')
+      })
+    }
+
+    state.retryNow = () => {
+      if (peerRef.current !== peer) return
+      const conn = connectionsRef.current.get('host')
+      if (conn?.open) return
+      clearTimeout(state.retryTimer)
+      connectToHost()
+    }
 
     // Register the call listener immediately so the screen is never missed.
     peer.on('call', call => {
@@ -587,61 +904,30 @@ function App() {
       call.on('error', error => console.error('Stream error:', error))
     })
 
-    peer.on('open', () => {
-      const conn = peer.connect(PEER_PREFIX + code, { reliable: true })
-      connectionsRef.current.set('host', conn)
-
-      const timeout = setTimeout(() => {
-        if (peerRef.current === peer && !conn.open) {
-          notify(relayReady ? 'Could not reach the host. Check the code and that the laptop session is still open.' : 'Could not reach the host. On different networks this needs a TURN key (see setup). Same Wi-Fi works without one.')
-          leaveSession()
-        }
-      }, 20000)
-
-      conn.on('open', () => {
-        clearTimeout(timeout)
-        setStatus('live')
-        setJoiners([code])
-        conn.send({ type: 'ready' })
-      })
-
-      conn.on('data', handleHostMessage)
-
-      conn.on('close', () => {
-        clearTimeout(timeout)
-        if (peerRef.current === peer) {
-          notify('The host ended the session.')
-          leaveSession()
-        }
-      })
-
-      conn.on('error', error => {
-        console.error(error)
-        clearTimeout(timeout)
-        if (peerRef.current === peer) {
-          notify('Unable to connect. Check the room code.')
-          leaveSession()
-        }
-      })
-    })
+    peer.on('open', () => connectToHost())
 
     peer.on('disconnected', () => {
       if (!peer.destroyed) peer.reconnect()
     })
 
     peer.on('error', error => {
+      if (peerRef.current !== peer) return
       console.error(error)
 
-      if (peerRef.current !== peer) return
-
       if (error.type === 'peer-unavailable') {
-        notify('Room not found. Check the code and that the laptop session is active.')
+        hostLost('Room not found. Check the code and that the laptop session is active.')
+      } else if (
+        ['network', 'server-error', 'socket-error', 'socket-closed'].includes(error.type)
+      ) {
+        setStatus('reconnecting')
+      } else if (!state.everConnected && !state.restoring) {
+        notify(`Connection error: ${error.type}`)
         leaveSession()
-      } else if (error.type === 'network' || error.type === 'server-error') {
-        notify('Network problem. Retrying...')
       }
     })
   }
+
+  const handleJoin = () => joinRoom(joinCode)
 
   const requestScreen = () => {
     const conn = connectionsRef.current.get('host')
@@ -781,8 +1067,7 @@ function App() {
   }
 
   // Grayscale + contrast, inverts dark themes, and scales to a good OCR size.
-  const preprocessImage = source => {
-    const target = cropRect ? 1600 : 2000
+  const preprocessImage = (source, target = 2000) => {
     const scale = Math.min(3, Math.max(0.5, target / source.width))
 
     const canvas = document.createElement('canvas')
@@ -818,6 +1103,33 @@ function App() {
     return canvas
   }
 
+  // One OCR job at a time, so live scans and screenshots never clash.
+  const recognizeQuestion = (source, target) => {
+    const run = async () => {
+      const worker = await getWorker()
+      const enhanced = preprocessImage(source, target)
+
+      // Pass 1: text block.
+      await worker.setParameters({ tessedit_pageseg_mode: '6' })
+      const first = await worker.recognize(enhanced)
+      let best = extractQuestionAndOptions(first.data.text)
+
+      // Pass 2 only when pass 1 found nothing: scattered text.
+      if (!best.question) {
+        await worker.setParameters({ tessedit_pageseg_mode: '11' })
+        const second = await worker.recognize(enhanced)
+        const alt = extractQuestionAndOptions(second.data.text)
+        if (scoreExtraction(alt) > scoreExtraction(best)) best = alt
+      }
+
+      return best
+    }
+
+    const job = ocrQueueRef.current.then(run)
+    ocrQueueRef.current = job.catch(() => {})
+    return job
+  }
+
   const scanScreen = async ({ automatic = false } = {}) => {
     if (isScanningRef.current) return
     if (!automatic) setOcrError('')
@@ -846,21 +1158,7 @@ function App() {
       setIsScanning(true)
       setOcrProgress(0)
 
-      const worker = await getWorker()
-      const enhanced = preprocessImage(frame)
-
-      // Pass 1: text block.
-      await worker.setParameters({ tessedit_pageseg_mode: '6' })
-      const first = await worker.recognize(enhanced)
-      let best = extractQuestionAndOptions(first.data.text)
-
-      // Pass 2 only when pass 1 found nothing: scattered text.
-      if (!best.question) {
-        await worker.setParameters({ tessedit_pageseg_mode: '11' })
-        const second = await worker.recognize(enhanced)
-        const alt = extractQuestionAndOptions(second.data.text)
-        if (scoreExtraction(alt) > scoreExtraction(best)) best = alt
-      }
+      const best = await recognizeQuestion(frame, cropRect ? 1600 : 2000)
 
       if (!best.question) {
         if (!automatic) {
@@ -927,6 +1225,141 @@ function App() {
     } catch {
       notify(failMessage)
     }
+  }
+
+  /* ------------------------- screenshots ------------------------- */
+
+  const closeShot = () => {
+    setShot(prev => {
+      if (prev?.url) URL.revokeObjectURL(prev.url)
+      return null
+    })
+  }
+
+  const blobToCanvas = async blob => {
+    const bitmap = await createImageBitmap(blob)
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    canvas.getContext('2d', { willReadFrequently: true }).drawImage(bitmap, 0, 0)
+    bitmap.close?.()
+    return canvas
+  }
+
+  const canvasToPngBlob = canvas =>
+    new Promise((resolve, reject) => {
+      canvas.toBlob(
+        result => (result ? resolve(result) : reject(new Error('Could not read the image.'))),
+        'image/png'
+      )
+    })
+
+  // Any new screenshot (paste, drop, picker, clipboard) ends up here.
+  const handleScreenshotBlob = async (blob, { skipDuplicate = false } = {}) => {
+    if (!blob || !blob.type?.startsWith('image/')) return
+
+    const signature = `${blob.type}:${blob.size}`
+    if (skipDuplicate && signature === lastShotSigRef.current) return
+    lastShotSigRef.current = signature
+
+    const id = Date.now()
+
+    try {
+      const canvas = await blobToCanvas(blob)
+      const png = blob.type === 'image/png' ? blob : await canvasToPngBlob(canvas)
+      const url = URL.createObjectURL(png)
+
+      setShot(prev => {
+        if (prev?.url) URL.revokeObjectURL(prev.url)
+        return { id, url, blob: png, status: 'scanning', extracted: null, error: '' }
+      })
+      setOcrProgress(0)
+
+      const best = await recognizeQuestion(canvas, 2000)
+
+      setShot(prev =>
+        prev && prev.id === id
+          ? { ...prev, status: 'done', extracted: best.question ? best : null }
+          : prev
+      )
+    } catch (error) {
+      console.error('Screenshot error:', error)
+      setShot(prev =>
+        prev && prev.id === id
+          ? { ...prev, status: 'done', error: 'Could not read text from this screenshot.' }
+          : prev
+      )
+      notify('Could not read that image.')
+    }
+  }
+
+  // Looks for a new image in the clipboard (needs the clipboard permission).
+  const checkClipboardForImage = async ({ prime = false } = {}) => {
+    if (!navigator.clipboard?.read) return
+
+    try {
+      const items = await navigator.clipboard.read()
+
+      for (const item of items) {
+        const type = item.types.find(name => name.startsWith('image/'))
+        if (!type) continue
+
+        const blob = await item.getType(type)
+
+        if (prime) {
+          lastShotSigRef.current = `${blob.type}:${blob.size}`
+        } else {
+          await handleScreenshotBlob(blob, { skipDuplicate: true })
+        }
+        return
+      }
+    } catch {
+      /* permission denied, or the tab is not focused */
+    }
+  }
+
+  const toggleClipWatch = enabled => {
+    setClipWatch(enabled)
+    if (enabled) {
+      // Asks for permission now, and ignores whatever is already copied.
+      checkClipboardForImage({ prime: true })
+    }
+  }
+
+  // Copies the screenshot, then opens Claude with the question typed in.
+  const sendShotToClaude = () => {
+    if (!shot) return
+
+    const base = shot.extracted?.question
+      ? buildPrompt(shot.extracted)
+      : 'Find the question in the attached screenshot and give me the correct answer. If it has options, tell me which option is correct.'
+
+    const prompt = `${base}\n\n(The screenshot of the question is attached.)`.slice(0, 1800)
+
+    // Start the copy first, while this tab still has focus.
+    let copying
+    try {
+      if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
+        throw new Error('Image copy is not supported here.')
+      }
+      copying = navigator.clipboard.write([
+        new ClipboardItem({ 'image/png': shot.blob })
+      ])
+    } catch (error) {
+      copying = Promise.reject(error)
+    }
+
+    window.open(`https://claude.ai/new?q=${encodeURIComponent(prompt)}`, '_blank')
+
+    copying
+      .then(() =>
+        notify('Screenshot copied. In Claude, paste it (Ctrl+V) next to the question, then send.')
+      )
+      .catch(() =>
+        notify('Could not copy the screenshot. Attach it in Claude manually.')
+      )
+
+    closeShot()
   }
 
   /* ------------------------- crop selection ------------------------- */
@@ -1071,6 +1504,34 @@ function App() {
 
         <div className="max-w-6xl mx-auto p-3 sm:p-4 md:p-6 space-y-4 sm:space-y-6">
 
+          {/* SCREENSHOTS */}
+          <section className="bg-[#1a102a] border border-purple-500/20 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0 flex-1 basis-64">
+              <h2 className="font-semibold text-sm">Screenshots</h2>
+              <p className="text-xs text-gray-400 mt-1">
+                Take a screenshot, then paste it here (Ctrl+V), drop it on this page, or tap Add Screenshot. EmeeT reads the question and offers to send it to Claude.
+              </p>
+              <label className="flex items-start gap-2 mt-2 text-xs text-gray-400 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={clipWatch}
+                  onChange={e => toggleClipWatch(e.target.checked)}
+                  className="accent-purple-500 w-4 h-4 mt-0.5"
+                />
+                <span>
+                  Detect copied screenshots when I return to this tab (asks for clipboard permission)
+                </span>
+              </label>
+            </div>
+
+            <button
+              onClick={() => shotInputRef.current?.click()}
+              className="bg-purple-600 hover:bg-purple-500 px-5 py-3 rounded-xl text-sm font-medium"
+            >
+              Add Screenshot
+            </button>
+          </section>
+
           {/* ROOM CONNECTION */}
           {roomCode && isHost && (
             <section className="bg-purple-600/20 border border-purple-500/40 rounded-2xl p-4 sm:p-5 flex flex-wrap justify-between items-center gap-3">
@@ -1146,7 +1607,9 @@ function App() {
                 <p className="text-amber-300 text-sm mt-4">
                   {status === 'live'
                     ? 'Connected. Waiting for the laptop to start sharing. If the screen does not appear within 15 seconds, tap Request Screen.'
-                    : 'Connecting to the laptop...'}
+                    : status === 'reconnecting'
+                      ? 'Reconnecting to the laptop. This resumes on its own.'
+                      : 'Connecting to the laptop...'}
                 </p>
               )}
             </section>
@@ -1395,6 +1858,90 @@ function App() {
                 className="flex-1 bg-purple-600 rounded-xl p-3"
               >
                 Connect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* HIDDEN FILE PICKER (phone gallery / files) */}
+      <input
+        ref={shotInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={e => {
+          const file = e.target.files?.[0]
+          if (file) handleScreenshotBlob(file)
+          e.target.value = ''
+        }}
+      />
+
+      {/* SCREENSHOT DETECTED */}
+      {shot && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-end sm:items-center justify-center p-3 sm:p-4">
+          <div className="bg-[#1a102a] border border-purple-500/30 rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-4 sm:p-6">
+            <h2 className="text-xl font-semibold">Screenshot detected</h2>
+            <p className="text-sm text-gray-400 mt-1">
+              Send it to Claude together with the question found in it?
+            </p>
+
+            <img
+              src={shot.url}
+              alt="Screenshot preview"
+              className="mt-4 w-full max-h-56 object-contain rounded-xl border border-purple-900/50 bg-black"
+            />
+
+            <div className="mt-4 bg-[#120b1e] rounded-xl p-4 border border-purple-800/40">
+              {shot.status === 'scanning' && (
+                <p className="text-sm text-purple-200">
+                  Reading the question... {ocrProgress > 0 ? `${ocrProgress}%` : ''}
+                </p>
+              )}
+
+              {shot.status === 'done' && shot.extracted && (
+                <>
+                  <p className="text-xs text-purple-300 mb-2">EXTRACTED QUESTION</p>
+                  <p className="font-medium leading-relaxed">{shot.extracted.question}</p>
+
+                  {shot.extracted.options.length > 0 && (
+                    <div className="mt-3 space-y-1">
+                      <p className="text-xs text-purple-300">ANSWER OPTIONS</p>
+                      {shot.extracted.options.map((option, index) => (
+                        <p key={index} className="text-sm text-gray-300">
+                          {option}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {shot.status === 'done' && !shot.extracted && (
+                <p className="text-sm text-amber-300">
+                  {shot.error ||
+                    'No clear question text was found. Claude can still read the screenshot itself.'}
+                </p>
+              )}
+            </div>
+
+            <p className="text-xs text-gray-500 mt-3">
+              The screenshot is copied and Claude opens with the question typed in. Paste the screenshot into the message (Ctrl+V), then send.
+            </p>
+
+            <div className="flex gap-3 mt-5">
+              <button
+                onClick={closeShot}
+                className="flex-1 bg-[#241538] rounded-xl p-3"
+              >
+                Dismiss
+              </button>
+              <button
+                onClick={sendShotToClaude}
+                disabled={shot.status === 'scanning'}
+                className="flex-1 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 rounded-xl p-3 font-medium"
+              >
+                {shot.status === 'scanning' ? 'Reading...' : 'Send to Claude'}
               </button>
             </div>
           </div>
